@@ -14,3 +14,4 @@ curl_cffi>=0.7       # Chrome impersonation -- REQUIRED to prevent Yahoo Finance
 # PySide6>=6.6
 
 # News module uses only Python stdlib (urllib, xml.etree) -- no extra packages.
+gunicorn
