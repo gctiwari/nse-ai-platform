@@ -1,0 +1,16 @@
+pandas>=2.0
+numpy>=1.24
+Flask>=3.0            # web UI backend (primary UI -- see webapp_main.py)
+openpyxl>=3.1        # Excel export
+matplotlib>=3.8      # charting (equity curve, analytics)
+yfinance>=0.2.40     # live NSE price/OHLCV/fundamentals/news (default data provider)
+curl_cffi>=0.7       # Chrome impersonation -- REQUIRED to prevent Yahoo Finance blocking
+                     # yfinance. Without this, every ticker returns "Expecting value: line
+                     # 1 column 1" or "possibly delisted" because Yahoo returns an HTML
+                     # block page instead of JSON. This is yfinance's own recommended fix.
+
+# Legacy desktop UI (ui/main_window.py) -- superseded by the Flask web UI.
+# Only install if you specifically want the old PySide6 desktop app.
+# PySide6>=6.6
+
+# News module uses only Python stdlib (urllib, xml.etree) -- no extra packages.
