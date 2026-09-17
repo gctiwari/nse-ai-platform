@@ -34,6 +34,7 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
+import os
 
 from core.models import MarketSnapshot
 
@@ -512,9 +513,16 @@ class YFinanceDataProvider(DataProvider):
     """
 
     HTTP_TIMEOUT_SEC = 15
-    INTER_REQUEST_DELAY_SEC = 0.5   # gap between supplemental per-ticker calls
+    INTER_REQUEST_DELAY_SEC = 1.5   # gap between supplemental per-ticker calls
 
     def __init__(self, universe: Iterable[tuple[str, str, str]] | None = None):
+        os.environ.setdefault("YFINANCE_CACHE_DIR", "/tmp/yfinance")
+        try:
+            import yfinance as yf
+            yf.set_tz_cache_location("/tmp/yfinance")
+        except Exception as e:
+            logger.debug("Could not configure yfinance cache location: %s", e)
+
         self._explicit_universe = list(universe) if universe else None
         self._history_cache: dict = {}
         self._last_universe_info: dict = {}
@@ -646,7 +654,7 @@ class YFinanceDataProvider(DataProvider):
         tickers = [f"{s}.NS" for s in symbols]
         try:
             kwargs = dict(
-                period="1y", group_by="ticker", threads=True,
+                period="1y", group_by="ticker", threads=False,
                 progress=False, auto_adjust=False, timeout=self.HTTP_TIMEOUT_SEC,
             )
             if self._session is not None:
