@@ -512,27 +512,92 @@ class YFinanceDataProvider(DataProvider):
     """
 
     HTTP_TIMEOUT_SEC = 15
+    INTER_REQUEST_DELAY_SEC = 0.5   # gap between supplemental per-ticker calls
 
     def __init__(self, universe: Iterable[tuple[str, str, str]] | None = None):
         self._explicit_universe = list(universe) if universe else None
         self._history_cache: dict = {}
         self._last_universe_info: dict = {}
         self._session = self._make_session()
+        self._last_request_time: float = 0.0
+        self._last_refresh_at: float = 0.0
 
     @staticmethod
     def _make_session():
-        """Creates a curl_cffi session that impersonates Chrome. Falls back
-        to None (yfinance default behaviour) if curl_cffi isn't installed,
-        so the provider still works -- just with the original bot-block risk."""
+        """
+        Creates a curl_cffi Chrome session AND warms it up with a real request
+        to finance.yahoo.com. The warmup is critical: it forces the crumb
+        handshake before any concurrent data calls begin, preventing the cold-
+        handshake race that Yahoo blocks.
+        """
         try:
             from curl_cffi import requests as curl_requests
-            session = curl_requests.Session(impersonate="chrome")
-            logger.info("curl_cffi Chrome-impersonation session created (Yahoo bot-block fix active)")
-            return session
         except ImportError:
-            logger.warning("curl_cffi not installed -- yfinance will use its default requests "
-                           "session, which Yahoo Finance may block. Fix: pip install curl_cffi")
+            logger.warning("curl_cffi not installed — Yahoo WILL block requests. Fix: pip install curl_cffi")
             return None
+
+        for impersonate in ("chrome120", "chrome110", "chrome99", "chrome"):
+            try:
+                session = curl_requests.Session(impersonate=impersonate)
+                r = session.get("https://finance.yahoo.com", timeout=12, allow_redirects=True)
+                if r.status_code < 400:
+                    logger.info("curl_cffi session warmed up (impersonate=%s)", impersonate)
+                    return session
+            except Exception as e:
+                logger.debug("Warmup failed for %s: %s", impersonate, e)
+
+        logger.warning("curl_cffi warmup failed — proceeding without warmup")
+        try:
+            from curl_cffi import requests as curl_requests
+            return curl_requests.Session(impersonate="chrome")
+        except Exception:
+            return None
+
+    def _refresh_session(self) -> None:
+        """Called when Yahoo returns 401 Invalid Crumb mid-run. Re-warms the
+        session at most once per 60 seconds to avoid thrashing."""
+        import time
+        now = time.monotonic()
+        if now - self._last_refresh_at < 60:
+            return
+        logger.info("Crumb expired (HTTP 401) — refreshing session…")
+        new_session = self._make_session()
+        if new_session is not None:
+            self._session = new_session
+            logger.info("Session refreshed")
+        self._last_refresh_at = now
+
+    def _rate_limit(self) -> None:
+        import time
+        elapsed = time.monotonic() - self._last_request_time
+        if elapsed < self.INTER_REQUEST_DELAY_SEC:
+            time.sleep(self.INTER_REQUEST_DELAY_SEC - elapsed)
+        self._last_request_time = time.monotonic()
+
+    def _safe_info(self, ticker) -> dict:
+        """Fetches .info; retries once after refreshing the session on 401."""
+        self._rate_limit()
+        try:
+            info = ticker.info
+            return info if isinstance(info, dict) else {}
+        except Exception as e:
+            msg = str(e)
+            if "401" in msg or "Invalid Crumb" in msg or "Unauthorized" in msg:
+                self._refresh_session()
+                try:
+                    import yfinance as yf
+                    tkw = {"session": self._session} if self._session else {}
+                    info = yf.Ticker(ticker.ticker, **tkw).info
+                    return info if isinstance(info, dict) else {}
+                except Exception:
+                    return {}
+            elif "404" in msg or "Not Found" in msg or "No fundamentals" in msg:
+                return {}   # expected for many NSE stocks — no data on Yahoo
+            else:
+                logger.info("`.info` unavailable for %s (%s) -- using neutral fundamentals",
+                            ticker.ticker, e)
+                return {}
+
 
     def get_universe(self):
         if self._explicit_universe is not None:
@@ -610,19 +675,6 @@ class YFinanceDataProvider(DataProvider):
         kwargs = {"session": self._session} if self._session is not None else {}
         ticker = yf_module.Ticker(f"{symbol}.NS", **kwargs)
         return ticker.history(period="1y", timeout=self.HTTP_TIMEOUT_SEC)
-
-    @staticmethod
-    def _safe_info(ticker) -> dict:
-        """`.info` is the slowest/flakiest yfinance call (needs a crumb/cookie
-        handshake that some networks block or stall). Never let its failure
-        take down the whole snapshot -- fall back to an empty dict; the
-        neutral-default logic below fills in reasonable fundamentals."""
-        try:
-            info = ticker.info
-            return info if isinstance(info, dict) else {}
-        except Exception as e:
-            logger.info("`.info` unavailable for %s (%s) -- using neutral fundamentals", ticker.ticker, e)
-            return {}
 
     # Sectors where a raw Debt/Equity ceiling is the wrong leverage lens
     # (banks/NBFCs run naturally high D/E as their business model -- see
