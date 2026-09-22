@@ -168,9 +168,6 @@ class ScoreBreakdown:
     growth_score: float
     cash_flow_quality_score: float
     profitability_score: float
-    financial_health_score: float
-    ownership_score: float
-    earnings_quality_score: float
     overall_ai_score: float
     confidence_score: float
 
@@ -215,10 +212,6 @@ class Recommendation:
     news_negative_factors: list = field(default_factory=list)
     news_event_tags: list = field(default_factory=list)
     news_article_count: int = 0
-    price_history: list = field(default_factory=list)
-    high_history: list = field(default_factory=list)
-    low_history: list = field(default_factory=list)
-    volume_history: list = field(default_factory=list)
     recommendation_id: Optional[int] = None
     recommendation_version: int = 1
     parent_recommendation_id: Optional[int] = None

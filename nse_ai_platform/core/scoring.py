@@ -22,10 +22,6 @@ from dataclasses import dataclass
 from core.models import MarketSnapshot, TechnicalLevels, ScoreBreakdown
 from core.fundamental_analysis import score_growth_pillar, score_cash_flow_quality_pillar
 from core.profitability import score_profitability_pillar
-from core.financial_health import score_financial_health_pillar
-from core.ownership import score_ownership_pillar
-from core.earnings_quality import score_earnings_quality_pillar
-from core.valuation import score_valuation_pillar
 from news.models import NewsAnalysisResult
 
 import logging
@@ -56,17 +52,14 @@ class ScoringWeights:
     shouldn't dominate a multi-factor score built mostly from financials
     and price action.
     """
-    fundamental: float = 0.08
-    technical: float = 0.15
-    valuation: float = 0.12
-    sentiment: float = 0.07
-    quality: float = 0.08
+    fundamental: float = 0.10
+    technical: float = 0.20
+    valuation: float = 0.20
+    sentiment: float = 0.10   # <-- news sentiment weight (configurable "news influence")
+    quality: float = 0.10
     growth: float = 0.10
-    cash_flow_quality: float = 0.10
-    profitability: float = 0.10
-    financial_health: float = 0.08
-    ownership: float = 0.07
-    earnings_quality: float = 0.05
+    cash_flow_quality: float = 0.10   # OCF/NI, capex intensity, FCF-vs-earnings alignment (spec §2.4)
+    profitability: float = 0.10       # ROE/ROCE, margin trend, DuPont leverage flag (spec §2.2)
 
 
 DEFAULT_WEIGHTS = ScoringWeights()
@@ -102,25 +95,19 @@ def score_cash_flow_quality(s: MarketSnapshot) -> float:
 
 
 def score_profitability(s: MarketSnapshot) -> float:
+    """Delegates to core/profitability.py's ROE/ROCE + margin trend +
+    DuPont leverage-flag pillar (spec §2.2)."""
     score, _facts = score_profitability_pillar(s)
-    return score
-
-def score_financial_health(s: MarketSnapshot) -> float:
-    score, _facts = score_financial_health_pillar(s)
-    return score
-
-def score_ownership(s: MarketSnapshot) -> float:
-    score, _facts = score_ownership_pillar(s)
-    return score
-
-def score_earnings_quality(s: MarketSnapshot) -> float:
-    score, _facts = score_earnings_quality_pillar(s)
     return score
 
 
 def score_valuation(s: MarketSnapshot) -> float:
-    score, _verdict, _facts = score_valuation_pillar(s)
-    return score
+    # Cheaper relative to sector & PEG < 1 scores higher.
+    pe_relative = _scale(-(s.pe_ratio - s.sector_avg_pe), -20, 20)
+    peg_score = _scale(-(s.peg_ratio - 1.0), -1.5, 1.5)
+    pb_score = _scale(-s.pb_ratio, -10, -0.5)
+    ev_ebitda_score = _scale(-s.ev_ebitda, -25, -5)
+    return round(0.35 * pe_relative + 0.30 * peg_score + 0.20 * pb_score + 0.15 * ev_ebitda_score, 1)
 
 
 def score_technical(t: TechnicalLevels, price: float) -> float:
@@ -188,35 +175,35 @@ def score_stock(snapshot: MarketSnapshot, technicals: TechnicalLevels, news: New
     growth = score_growth(snapshot)
     cash_flow_quality = score_cash_flow_quality(snapshot)
     profitability = score_profitability(snapshot)
-    financial_health = score_financial_health(snapshot)
-    ownership = score_ownership(snapshot)
-    earnings_quality = score_earnings_quality(snapshot)
     risk = score_risk(snapshot, technicals)
 
     overall = round(
-        weights.fundamental * fundamental
-        + weights.technical * technical
-        + weights.valuation * valuation
-        + weights.sentiment * sentiment
-        + weights.quality * quality
-        + weights.growth * growth
-        + weights.cash_flow_quality * cash_flow_quality
-        + weights.profitability * profitability
-        + weights.financial_health * financial_health
-        + weights.ownership * ownership
-        + weights.earnings_quality * earnings_quality, 1
+        weights.fundamental * fundamental +
+        weights.technical * technical +
+        weights.valuation * valuation +
+        weights.sentiment * sentiment +
+        weights.quality * quality +
+        weights.growth * growth +
+        weights.cash_flow_quality * cash_flow_quality +
+        weights.profitability * profitability, 1
     )
+    # Overall score is nudged down when risk is high, so a "great but very
+    # risky" stock doesn't rank above a "good and safe" one purely on raw factors.
     risk_adjustment = (risk - 50) * 0.08
     overall = round(_clip(overall + risk_adjustment), 1)
-    confidence = score_confidence([fundamental, technical, valuation, sentiment,
-                                    growth, profitability, financial_health])
+
+    confidence = score_confidence([fundamental, technical, valuation, sentiment])
 
     return ScoreBreakdown(
-        fundamental_score=fundamental, technical_score=technical,
-        valuation_score=valuation, sentiment_score=sentiment, risk_score=risk,
-        quality_score=quality, growth_score=growth,
-        cash_flow_quality_score=cash_flow_quality, profitability_score=profitability,
-        financial_health_score=financial_health, ownership_score=ownership,
-        earnings_quality_score=earnings_quality,
-        overall_ai_score=overall, confidence_score=confidence,
+        fundamental_score=fundamental,
+        technical_score=technical,
+        valuation_score=valuation,
+        sentiment_score=sentiment,
+        risk_score=risk,
+        quality_score=quality,
+        growth_score=growth,
+        cash_flow_quality_score=cash_flow_quality,
+        profitability_score=profitability,
+        overall_ai_score=overall,
+        confidence_score=confidence,
     )

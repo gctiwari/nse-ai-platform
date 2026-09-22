@@ -34,7 +34,6 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
-import os
 
 from core.models import MarketSnapshot
 
@@ -513,99 +512,145 @@ class YFinanceDataProvider(DataProvider):
     """
 
     HTTP_TIMEOUT_SEC = 15
-    INTER_REQUEST_DELAY_SEC = 1.5   # gap between supplemental per-ticker calls
+    # Minimum gap between per-ticker supplemental calls on large universes.
+    INTER_REQUEST_DELAY_SEC = 0.5
 
     def __init__(self, universe: Iterable[tuple[str, str, str]] | None = None):
-        os.environ.setdefault("YFINANCE_CACHE_DIR", "/tmp/yfinance")
-        try:
-            import yfinance as yf
-            yf.set_tz_cache_location("/tmp/yfinance")
-        except Exception as e:
-            logger.debug("Could not configure yfinance cache location: %s", e)
-
         self._explicit_universe = list(universe) if universe else None
         self._history_cache: dict = {}
         self._last_universe_info: dict = {}
-        self._session = self._make_session()
+        self._crumb: str | None = None          # fetched once, refreshed on 401
         self._last_request_time: float = 0.0
         self._last_refresh_at: float = 0.0
+        self._session = self._make_session()
 
-    @staticmethod
-    def _make_session():
+    def _make_session(self):
         """
-        Creates a curl_cffi Chrome session AND warms it up with a real request
-        to finance.yahoo.com. The warmup is critical: it forces the crumb
-        handshake before any concurrent data calls begin, preventing the cold-
-        handshake race that Yahoo blocks.
+        Creates a curl_cffi Chrome session, warms it up with a real request
+        to finance.yahoo.com to populate the cookie jar, then IMMEDIATELY
+        fetches and stores the crumb from Yahoo's crumb endpoint.
+
+        Why pre-fetching the crumb matters on Render (cloud deployments):
+          1. Session created with no cookies.
+          2. yfinance calls getcrumb with no cookies → Yahoo returns 429/empty.
+          3. yfinance stores None as crumb.
+          4. Every quoteSummary call sends crumb= (empty) → 401 Invalid Crumb.
+          5. Yahoo flags the IP → "User is unable to access this feature".
+
+        Fix: we fetch the crumb ourselves with a warmed-up session, inject
+        it into yfinance's YfData cache so yfinance never hits getcrumb
+        at all, and re-inject on every new Ticker object.
         """
         try:
             from curl_cffi import requests as curl_requests
         except ImportError:
-            logger.warning("curl_cffi not installed — Yahoo WILL block requests. Fix: pip install curl_cffi")
+            logger.warning("curl_cffi not installed — Yahoo WILL block requests. "
+                           "Fix: pip install curl_cffi")
             return None
 
+        # Try Chrome versions newest-first; a valid warmup response is required
         for impersonate in ("chrome120", "chrome110", "chrome99", "chrome"):
             try:
                 session = curl_requests.Session(impersonate=impersonate)
-                r = session.get("https://finance.yahoo.com", timeout=12, allow_redirects=True)
-                if r.status_code < 400:
-                    logger.info("curl_cffi session warmed up (impersonate=%s)", impersonate)
-                    return session
-            except Exception as e:
-                logger.debug("Warmup failed for %s: %s", impersonate, e)
 
-        logger.warning("curl_cffi warmup failed — proceeding without warmup")
+                # Step 1: Warm up — get cookies from finance.yahoo.com
+                r = session.get("https://finance.yahoo.com", timeout=12,
+                                allow_redirects=True)
+                if r.status_code >= 400:
+                    continue
+
+                # Step 2: Fetch crumb using the now-populated cookie jar
+                crumb = self._fetch_crumb(session)
+                if crumb:
+                    self._crumb = crumb
+                    # Inject into yfinance's module-level crumb cache so it
+                    # never hits the getcrumb endpoint on its own.
+                    self._inject_crumb_into_yfinance(crumb, session)
+                    logger.info("curl_cffi session ready (impersonate=%s, crumb fetched)",
+                                impersonate)
+                else:
+                    logger.warning("curl_cffi warmed up but crumb fetch returned empty "
+                                   "(impersonate=%s) — fundamentals will use neutral defaults",
+                                   impersonate)
+                    logger.info("curl_cffi session ready (impersonate=%s, no crumb)",
+                                impersonate)
+                return session
+
+            except Exception as e:
+                logger.debug("Session setup failed for %s: %s", impersonate, e)
+                continue
+
+        logger.warning("curl_cffi setup failed for all Chrome versions — "
+                       "falling back to default session (Yahoo may block)")
         try:
             from curl_cffi import requests as curl_requests
             return curl_requests.Session(impersonate="chrome")
         except Exception:
             return None
 
+    @staticmethod
+    def _fetch_crumb(session) -> str | None:
+        """
+        Fetches Yahoo's crumb string using a session that already has cookies.
+        Tries both query1 and query2 endpoints; returns None if both fail.
+        The crumb is a short alphanumeric string Yahoo requires as a query
+        parameter on every quoteSummary API call.
+        """
+        for url in (
+            "https://query2.finance.yahoo.com/v1/test/getcrumb",
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+        ):
+            try:
+                r = session.get(url, timeout=8, allow_redirects=True)
+                if r.status_code == 200 and r.text and len(r.text.strip()) < 64:
+                    return r.text.strip()
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _inject_crumb_into_yfinance(crumb: str, session) -> None:
+        """
+        Writes our pre-fetched crumb into yfinance's internal YfData crumb
+        cache. yfinance stores the crumb as a class-level attribute on
+        YfData; by pre-populating it, yfinance skips its own getcrumb call.
+        This is the key step that prevents the 429→401 cascade on Render.
+        """
+        try:
+            import yfinance.data as yf_data
+            if hasattr(yf_data, "YfData"):
+                yf_data.YfData._crumb = crumb
+                if hasattr(yf_data.YfData, "_session"):
+                    yf_data.YfData._session = session
+                if hasattr(yf_data.YfData, "cookie_strategy"):
+                    yf_data.YfData.cookie_strategy = "basic"
+        except Exception:
+            pass  # yfinance internals may vary by version; not critical to crash
+
     def _refresh_session(self) -> None:
-        """Called when Yahoo returns 401 Invalid Crumb mid-run. Re-warms the
-        session at most once per 60 seconds to avoid thrashing."""
+        """
+        Called when Yahoo returns 401 mid-run (crumb expired, ~5-10 min
+        window on large universes). Re-warms the session, re-fetches the
+        crumb, and re-injects it. Rate-limited to once per 60 seconds.
+        """
         import time
         now = time.monotonic()
         if now - self._last_refresh_at < 60:
             return
-        logger.info("Crumb expired (HTTP 401) — refreshing session…")
+        logger.info("Crumb expired — refreshing session and crumb…")
         new_session = self._make_session()
         if new_session is not None:
             self._session = new_session
-            logger.info("Session refreshed")
+            logger.info("Session and crumb refreshed successfully")
         self._last_refresh_at = now
 
     def _rate_limit(self) -> None:
+        """Enforces minimum gap between supplemental per-ticker API calls."""
         import time
         elapsed = time.monotonic() - self._last_request_time
         if elapsed < self.INTER_REQUEST_DELAY_SEC:
             time.sleep(self.INTER_REQUEST_DELAY_SEC - elapsed)
         self._last_request_time = time.monotonic()
-
-    def _safe_info(self, ticker) -> dict:
-        """Fetches .info; retries once after refreshing the session on 401."""
-        self._rate_limit()
-        try:
-            info = ticker.info
-            return info if isinstance(info, dict) else {}
-        except Exception as e:
-            msg = str(e)
-            if "401" in msg or "Invalid Crumb" in msg or "Unauthorized" in msg:
-                self._refresh_session()
-                try:
-                    import yfinance as yf
-                    tkw = {"session": self._session} if self._session else {}
-                    info = yf.Ticker(ticker.ticker, **tkw).info
-                    return info if isinstance(info, dict) else {}
-                except Exception:
-                    return {}
-            elif "404" in msg or "Not Found" in msg or "No fundamentals" in msg:
-                return {}   # expected for many NSE stocks — no data on Yahoo
-            else:
-                logger.info("`.info` unavailable for %s (%s) -- using neutral fundamentals",
-                            ticker.ticker, e)
-                return {}
-
 
     def get_universe(self):
         if self._explicit_universe is not None:
@@ -654,7 +699,7 @@ class YFinanceDataProvider(DataProvider):
         tickers = [f"{s}.NS" for s in symbols]
         try:
             kwargs = dict(
-                period="1y", group_by="ticker", threads=False,
+                period="1y", group_by="ticker", threads=True,
                 progress=False, auto_adjust=False, timeout=self.HTTP_TIMEOUT_SEC,
             )
             if self._session is not None:
@@ -682,7 +727,116 @@ class YFinanceDataProvider(DataProvider):
             return self._history_cache[symbol]
         kwargs = {"session": self._session} if self._session is not None else {}
         ticker = yf_module.Ticker(f"{symbol}.NS", **kwargs)
-        return ticker.history(period="1y", timeout=self.HTTP_TIMEOUT_SEC)
+        return ticker.history(period="1y", auto_adjust=False, timeout=self.HTTP_TIMEOUT_SEC)
+
+    def _safe_info(self, ticker) -> dict:
+        """
+        Fetches fundamentals for one ticker. Uses a two-layer approach:
+
+        Layer 1 (preferred): direct curl_cffi call to quoteSummary API
+          with our pre-fetched crumb. This completely bypasses yfinance's
+          crumb management, which is the component that fails on Render.
+
+        Layer 2 (fallback): yfinance's ticker.info, used only when the
+          session or crumb is unavailable.
+
+        404 = Yahoo has no fundamental data for this symbol (expected for
+        many NSE mid/small-caps — logged at debug level, not an error).
+        401 = crumb expired → refresh session/crumb and retry once.
+        """
+        self._rate_limit()
+
+        # Layer 1: direct curl_cffi call if session and crumb are available
+        if self._session is not None and self._crumb is not None:
+            return self._fetch_info_direct(ticker.ticker)
+
+        # Layer 2: fallback to yfinance's own crumb management
+        try:
+            info = ticker.info
+            return info if isinstance(info, dict) else {}
+        except Exception as e:
+            msg = str(e)
+            if "401" in msg or "Invalid Crumb" in msg:
+                self._refresh_session()
+                try:
+                    import yfinance as yf
+                    tkw = {"session": self._session} if self._session else {}
+                    fresh = yf.Ticker(ticker.ticker, **tkw)
+                    info = fresh.info
+                    return info if isinstance(info, dict) else {}
+                except Exception:
+                    return {}
+            elif "404" in msg or "No fundamentals" in msg:
+                logger.debug("No Yahoo fundamentals for %s (404 — common for NSE stocks)", ticker.ticker)
+                return {}
+            logger.info("`.info` unavailable for %s (%s) -- using neutral fundamentals",
+                        ticker.ticker, e)
+            return {}
+
+    # QuoteSummary modules that cover everything ticker.info returns
+    _SUMMARY_MODULES = (
+        "summaryDetail,defaultKeyStatistics,financialData"
+    )
+    _SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+
+    def _fetch_info_direct(self, yf_symbol: str) -> dict:
+        """
+        Direct curl_cffi call to Yahoo's quoteSummary API using our stored
+        crumb. This is the production-safe path for Render: it never touches
+        yfinance's crumb management, so the 429→401 cascade cannot happen.
+
+        On 401: refreshes the crumb and retries once.
+        On 404: returns {} silently (no data for this symbol).
+        On any other error: returns {} (caller uses neutral defaults).
+        """
+        def _do_request(crumb: str) -> dict | None:
+            try:
+                r = self._session.get(
+                    self._SUMMARY_URL.format(symbol=yf_symbol),
+                    params={
+                        "modules": self._SUMMARY_MODULES,
+                        "crumb": crumb,
+                        "formatted": "false",
+                        "lang": "en-US",
+                        "region": "US",
+                    },
+                    timeout=self.HTTP_TIMEOUT_SEC,
+                )
+                if r.status_code == 401:
+                    return None   # signal: crumb expired, caller should refresh
+                if r.status_code == 404:
+                    return {}     # no data for this symbol
+                if r.status_code != 200:
+                    logger.debug("quoteSummary HTTP %d for %s", r.status_code, yf_symbol)
+                    return {}
+                data = r.json()
+                result = data.get("quoteSummary", {}).get("result") or []
+                if not result:
+                    return {}
+                # Merge all module dicts; extract `.raw` where present
+                merged = {}
+                for module in result:
+                    for k, v in module.items():
+                        if isinstance(v, dict):
+                            for fk, fv in v.items():
+                                if isinstance(fv, dict) and "raw" in fv:
+                                    merged[fk] = fv["raw"]
+                                elif not isinstance(fv, dict):
+                                    merged[fk] = fv
+                        elif not isinstance(v, (dict, list)):
+                            merged[k] = v
+                return merged
+            except Exception as e:
+                logger.debug("_fetch_info_direct error for %s: %s", yf_symbol, e)
+                return {}
+
+        result = _do_request(self._crumb)
+        if result is None:
+            # 401 → crumb expired → refresh and retry once
+            self._refresh_session()
+            if self._crumb:
+                result = _do_request(self._crumb)
+        return result or {}
 
     # Sectors where a raw Debt/Equity ceiling is the wrong leverage lens
     # (banks/NBFCs run naturally high D/E as their business model -- see
@@ -925,7 +1079,65 @@ class YFinanceDataProvider(DataProvider):
         info = self._safe_info(ticker)
 
         last = hist.iloc[-1]
-        price = float(last["Close"])
+
+        # ── Validated CMP: single source of truth for the entire signal ────
+        # Every downstream value (entry, SL, targets, R:R) derives from
+        # `price`; fixing the source here fixes the whole signal consistently.
+        price = None
+        price_source = "unknown"
+
+        # Primary: fast_info.last_price — no crumb needed, always current.
+        #   Market open  → last traded price (near-real-time)
+        #   Market closed → official session close price
+        try:
+            fi = ticker.fast_info
+            lp = getattr(fi, "last_price", None)
+            if lp and float(lp) > 0:
+                price = round(float(lp), 2)
+                price_source = "fast_info.last_price"
+        except Exception as _e:
+            logger.debug("fast_info unavailable for %s: %s", symbol, _e)
+
+        # Fallback: history Close, but only when it is demonstrably current.
+        if price is None:
+            hist_close = float(last["Close"])
+            if hist_close > 0:
+                # Staleness check: compare last bar date against today.
+                # Skip weekends/holidays gracefully — a Friday bar on Monday
+                # is 3 calendar days old but is the most recent close.
+                # We flag stale only when it is >5 calendar days old, which
+                # indicates Yahoo hasn't served fresh data at all.
+                from datetime import date as _date
+                bar_ts = hist.index[-1]
+                bar_date = bar_ts.date() if hasattr(bar_ts, "date") else _date.fromisoformat(str(bar_ts)[:10])
+                calendar_days_old = (_date.today() - bar_date).days
+                if calendar_days_old > 5:
+                    raise RuntimeError(
+                        f"Price data for {symbol} is {calendar_days_old} calendar days old "
+                        f"(last bar: {bar_date}). Yahoo Finance may not be serving fresh data. "
+                        f"Skipping this stock to avoid a misleading signal."
+                    )
+                price = round(hist_close, 2)
+                price_source = "history_close_fallback"
+                if calendar_days_old > 1:
+                    logger.warning(
+                        "%s CMP fallback: using history close %.2f from %s "
+                        "(%d calendar day(s) ago — fast_info unavailable). "
+                        "Signal may not reflect today's price if market is open.",
+                        symbol, price, bar_date, calendar_days_old
+                    )
+                else:
+                    logger.debug("%s CMP from history close %.2f (%s)", symbol, price, bar_date)
+
+        if price is None or price <= 0:
+            raise RuntimeError(
+                f"Could not obtain a valid price for {symbol} from any source "
+                f"(fast_info and history both failed). Skipping."
+            )
+
+        logger.debug("%s CMP=%.2f source=%s", symbol, price, price_source)
+        # ── End validated CMP ─────────────────────────────────────────────
+
         sector_name = info.get("sector") or sector
         sector_pe = SECTOR_AVG_PE.get(sector_name, DEFAULT_SECTOR_PE)
 

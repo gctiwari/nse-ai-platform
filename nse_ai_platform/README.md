@@ -4,35 +4,6 @@
 recommendations and maintains a simulated (paper) trading portfolio in a
 local SQLite database.
 
-## Status: Phase 10 — All spec pillars complete (§2.1–§2.7, §3, §4, §5)
-
-All sections of the analyst-grade redesign spec are now implemented,
-tested end-to-end, and wired through the full stack.
-
-**Pillars**: §2.1 Growth (multi-year CAGR+consistency), §2.2 Profitability
-(ROE/ROCE+DuPont), §2.3 Financial Health (liquidity+debt trend), §2.4
-Cash Flow Quality (OCF/NI+capex+FCF alignment), §2.5 Valuation
-(cross-sectional sector medians+analyst targets), §2.6 Ownership
-(promoter/institutional trend+short interest), §2.7 Earnings Quality
-(beat/miss streak+analyst consensus+upgrades). §3 Hard Disqualifiers
-(6 red-flag vetos). §4 Checklist-based classification (Conservative=6/8
-criteria, Balanced=4/6, not score-cutoffs). §5 Technical Analysis tab
-(8 indicators, composite Buy/Neutral/Sell, click-to-expand detail).
-
-**Weights (11 pillars, sum=1.0)**: fundamental=0.08, technical=0.15,
-valuation=0.12, sentiment=0.07, quality=0.08, growth=0.10,
-cash_flow_quality=0.10, profitability=0.10, financial_health=0.08,
-ownership=0.07, earnings_quality=0.05
-
-**Two-pass pipeline**: snapshots collected concurrently → sector stats
-computed → injected into each snapshot → scoring pass. Enables real
-cross-sectional valuation without hardcoded sector constants.
-
-**Bug fixes**: curl_cffi+fast_info Yahoo block fix; Watchlist separated
-from paper trades; re-recommendation refreshes open trade instead of
-duplicating; news display shows three distinct states; quality-over-quantity
-thresholds (score≥50, confidence≥45, R:R≥1.5, MAX=10 per category).
-
 ## Status: Phase 8 -- three bug fixes + quality filter
 
 ### Bug 1 fixed: same news component on every stock

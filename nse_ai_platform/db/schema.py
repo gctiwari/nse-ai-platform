@@ -84,9 +84,6 @@ CREATE TABLE IF NOT EXISTS recommendation (
     growth_score                       REAL,
     cash_flow_quality_score            REAL,
     profitability_score                REAL,
-    financial_health_score             REAL,
-    ownership_score                    REAL,
-    earnings_quality_score             REAL,
     risk_level                          TEXT,   -- Low/Medium/High
     risk_reward_ratio                    REAL,
     pivot_point REAL, s1 REAL, s2 REAL, s3 REAL,
@@ -95,11 +92,7 @@ CREATE TABLE IF NOT EXISTS recommendation (
     nearest_support REAL, nearest_resistance REAL,
     week52_high REAL, week52_low REAL, all_time_high REAL,
     distance_from_52w_high_pct REAL, distance_from_52w_low_pct REAL,
-    ai_explanation TEXT,
-    price_history  TEXT,
-    high_history   TEXT,
-    low_history    TEXT,
-    volume_history TEXT,
+    ai_explanation TEXT,                        -- human-readable reasoning
     news_sentiment_score REAL,                  -- -1..1, recency-weighted
     news_sentiment_label TEXT,                  -- Positive/Neutral/Negative
     news_overall_impact TEXT,                   -- Bullish/Neutral/Bearish
