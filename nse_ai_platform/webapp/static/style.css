@@ -199,21 +199,3 @@ table.data-table tr:hover td { background: var(--panel-raised); }
   .dh-row { flex-wrap: wrap; }
   .card-grid { grid-template-columns: 1fr 1fr; }
 }
-
-/* ── Technical Analysis Tab ─── */
-.signal-pill { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-.signal-buy  { background: #132a1e; color: var(--positive); }
-.signal-sell { background: #2a1313; color: var(--negative); }
-.signal-neutral { background: #1e1e28; color: var(--text-dim); }
-.ta-indicator-grid { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; background: var(--surface); }
-.ta-ind-card { min-width: 160px; max-width: 200px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); }
-.ta-ind-card.sig-buy  { border-color: #1e4230; }
-.ta-ind-card.sig-sell { border-color: #42201e; }
-.ta-ind-name   { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; }
-.ta-ind-val    { font-family: var(--font-mono); font-size: 12px; color: var(--text-primary); margin: 2px 0; }
-.ta-ind-signal { font-size: 11px; font-weight: 700; }
-.sig-buy .ta-ind-signal  { color: var(--positive); }
-.sig-sell .ta-ind-signal { color: var(--negative); }
-.sig-neutral .ta-ind-signal { color: var(--text-dim); }
-.ta-ind-reason { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
-.ta-detail-row td { background: var(--bg-alt); border-bottom: 2px solid var(--border); }

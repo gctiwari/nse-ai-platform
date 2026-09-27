@@ -722,12 +722,86 @@ class YFinanceDataProvider(DataProvider):
 
         logger.info("Batch-prefetched history for %d/%d symbols", len(self._history_cache), len(symbols))
 
+    def _fetch_ohlcv_direct(self, symbol: str):
+        """
+        Fetches 1-year daily OHLCV data via Yahoo's v8/finance/chart API.
+        This endpoint is genuinely crumb-free and works reliably from cloud
+        deployments (Render, etc.) even when yf.download() fails because
+        yfinance's crumb machinery is broken. Returns a pandas DataFrame
+        with the same columns as yf.history() (Open/High/Low/Close/Volume),
+        or None on failure.
+        """
+        import pandas as pd
+        session = self._session
+        if session is None:
+            return None
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS"
+        try:
+            r = session.get(url, params={
+                "interval": "1d", "range": "1y",
+                "includePrePost": "false",
+                "events": "div,splits",
+            }, timeout=self.HTTP_TIMEOUT_SEC)
+            if r.status_code != 200:
+                logger.debug("v8/chart HTTP %d for %s — will try yfinance fallback",
+                             r.status_code, symbol)
+                return None
+            data = r.json()
+            result = (data.get("chart") or {}).get("result") or []
+            if not result:
+                return None
+            res = result[0]
+            timestamps = res.get("timestamp") or []
+            q = (res.get("indicators") or {}).get("quote") or [{}]
+            quote = q[0]
+            closes = quote.get("close") or []
+            if not timestamps or not closes:
+                return None
+            # Build DataFrame aligned with yfinance output
+            df = pd.DataFrame({
+                "Open":   quote.get("open",   [None]*len(timestamps)),
+                "High":   quote.get("high",   [None]*len(timestamps)),
+                "Low":    quote.get("low",    [None]*len(timestamps)),
+                "Close":  closes,
+                "Volume": quote.get("volume", [0]*len(timestamps)),
+            }, index=pd.to_datetime(timestamps, unit="s", utc=True)
+                               .tz_convert("Asia/Kolkata"))
+            df.index.name = "Date"
+            # Drop rows where Close is missing (partial bars at start/end)
+            df = df.dropna(subset=["Close"])
+            return df if not df.empty else None
+        except Exception as e:
+            logger.debug("_fetch_ohlcv_direct failed for %s: %s", symbol, e)
+            return None
+
     def _get_history(self, symbol: str, yf_module):
+        """
+        Priority order:
+          1. Prefetch cache (populated by yf.download at run start)
+          2. Direct v8/chart API (crumb-free, works on cloud IPs)
+          3. yfinance Ticker.history() (crumb-dependent, used as last resort)
+        Returns a non-empty DataFrame or raises RuntimeError.
+        """
         if symbol in self._history_cache:
             return self._history_cache[symbol]
-        kwargs = {"session": self._session} if self._session is not None else {}
-        ticker = yf_module.Ticker(f"{symbol}.NS", **kwargs)
-        return ticker.history(period="1y", auto_adjust=False, timeout=self.HTTP_TIMEOUT_SEC)
+
+        # Try direct v8/chart first — no crumb required
+        df = self._fetch_ohlcv_direct(symbol)
+        if df is not None and not df.empty:
+            logger.debug("%s OHLCV via direct v8/chart (%d bars)", symbol, len(df))
+            return df
+
+        # Last resort: yfinance Ticker (may fail if crumb is broken)
+        try:
+            kwargs = {"session": self._session} if self._session is not None else {}
+            ticker = yf_module.Ticker(f"{symbol}.NS", **kwargs)
+            df = ticker.history(period="1y", auto_adjust=False, timeout=self.HTTP_TIMEOUT_SEC)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            logger.debug("ticker.history() failed for %s: %s", symbol, e)
+
+        return None   # caller raises RuntimeError
 
     def _safe_info(self, ticker) -> dict:
         """
@@ -859,16 +933,37 @@ class YFinanceDataProvider(DataProvider):
 
     def _fetch_deep_fundamentals(self, ticker, sector_name: str, symbol: str) -> dict:
         """
-        Pulls multi-year income statement / balance sheet / cash flow data
-        for the hard-disqualifier checks (core/disqualifiers.py) and the
-        Profitability (core/profitability.py) and Growth/Cash-Flow-Quality
-        (core/fundamental_analysis.py) pillars. Every piece is fetched and
-        parsed defensively -- yfinance's statement DataFrames are
-        considerably less standardized than `.info`, so a missing row or
-        an empty DataFrame for one company is expected and must not crash
-        the whole snapshot. Returns a dict of fields plus available/total
-        counts for the "Insufficient Data" disqualifier.
+        Pulls multi-year income statement / balance sheet / cash flow data.
+        Every yfinance call here uses crumb-dependent endpoints; if the
+        crumb is broken (401 on Render or similar) these will raise. We
+        catch ALL exceptions at the outer level and return empty deep-
+        fundamentals so the pipeline continues with neutral defaults. The
+        disqualifier's 'Insufficient Data' gate handles this gracefully.
         """
+        _empty = {
+            "total_equity": None, "total_assets": None, "interest_coverage": None,
+            "ocf_to_ni_history": [], "revenue_history_annual": [],
+            "earnings_history_annual": [], "fcf_history_annual": [],
+            "capex_history_annual": [], "ocf_history_annual": [],
+            "current_ratio": None, "quick_ratio": None, "total_debt_history": [],
+            "current_assets_history": [], "current_liab_history": [], "beta": None,
+            "promoter_holding_pct_prev": None, "institutional_pct_prev": None,
+            "shares_short_ratio": None, "analyst_target_mean": None,
+            "analyst_target_high": None, "analyst_target_low": None,
+            "analyst_recommendation_mean": None, "analyst_count": 0,
+            "upgrades_90d": 0, "downgrades_90d": 0, "earnings_date_str": "",
+            "is_financial_sector": sector_name in self.FINANCIAL_SECTOR_BUCKETS,
+            "deep_fields_available": 0, "deep_fields_total": 9,
+        }
+        try:
+            return self._fetch_deep_fundamentals_inner(ticker, sector_name, symbol)
+        except Exception as e:
+            logger.info("Deep fundamentals unavailable for %s (%s) — using neutral defaults",
+                        symbol, e)
+            return _empty
+
+    def _fetch_deep_fundamentals_inner(self, ticker, sector_name: str, symbol: str) -> dict:
+        """Inner body of _fetch_deep_fundamentals — see outer wrapper for rationale."""
         result = {
             "total_equity": None, "total_assets": None, "interest_coverage": None,
             "ocf_to_ni_history": [], "revenue_history_annual": [],

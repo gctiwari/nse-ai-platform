@@ -28,7 +28,6 @@ from db.repository import RecommendationRepository
 from core.analytics import AnalyticsEngine
 from core.recommendation_engine import rank_to_color_hex, MAX_PER_CATEGORY
 from core.models import Category
-from core.technical_module import analyse as ta_analyse
 
 logger = logging.getLogger("webapp")
 
@@ -203,46 +202,6 @@ def api_trade_history(trade_id: int):
     analytics = AnalyticsEngine(db)
     df = analytics.trade_history(trade_id)
     return jsonify(_clean(df.to_dict(orient="records")))
-
-
-
-@app.route("/api/technical-analysis")
-def api_technical_analysis():
-    db = _get_db(); repo = RecommendationRepository(db)
-    results = []; seen = set()
-    for cat in [c.value for c in Category]:
-        for rec in repo.get_by_category(cat):
-            sym = rec["symbol"]
-            if sym in seen: continue
-            seen.add(sym)
-            try:
-                import json as _json
-                def pj(v):
-                    if isinstance(v, list): return v
-                    try: return _json.loads(v) if v else []
-                    except: return []
-                ph = pj(rec.get("price_history"))
-                if not ph: continue
-                ta = ta_analyse(sym, rec["current_price"], ph,
-                    pj(rec.get("high_history")), pj(rec.get("low_history")),
-                    pj(rec.get("volume_history")),
-                    rec.get("week52_high") or 0, rec.get("week52_low") or 0)
-                results.append({"symbol": sym,
-                    "company_name": rec.get("company_name", sym),
-                    "category": rec.get("category"),
-                    "current_price": rec["current_price"],
-                    "composite_signal": ta.composite_signal,
-                    "confidence": ta.confidence,
-                    "bullish_count": ta.bullish_count,
-                    "bearish_count": ta.bearish_count,
-                    "neutral_count": ta.neutral_count,
-                    "summary": ta.summary,
-                    "indicators": [{"name": i.name, "value": i.value,
-                        "signal": i.signal, "reason": i.reason} for i in ta.indicators]})
-            except Exception as e:
-                logger.debug("TA failed for %s: %s", sym, e)
-    results.sort(key=lambda r: ({"Buy":0,"Neutral":1,"Sell":2}.get(r["composite_signal"],1), -r["confidence"]))
-    return jsonify(_clean(results))
 
 
 @app.route("/api/history")

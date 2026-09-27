@@ -26,7 +26,6 @@ from data.providers import get_provider
 from core.feature_engineering import compute_technical_levels
 from core.scoring import score_stock
 from core.recommendation_engine import build_recommendation, rank_and_trim, classify_market_cap
-from core.valuation import compute_sector_stats, inject_sector_stats
 from core.paper_trading import PaperTradingEngine
 from core.analytics import AnalyticsEngine
 from news.engine import NewsAnalysisEngine
@@ -204,93 +203,9 @@ def run(data_provider_name: str = "yfinance", news_enabled: bool = True) -> dict
     except Exception:
         logger.exception("Prefetch failed -- continuing with per-symbol fetches")
 
-    # Two-pass approach: collect all snapshots first, compute sector stats,
-    # inject them, then score. This enables cross-sectional valuation (§2.5).
-    import math as _math, threading as _threading
-
-    raw_snaps: dict = {}; snap_timed_out = []; snap_failed = []
-    snap_lock = _threading.Lock()
-    budget = _math.ceil(len(universe)/MAX_CONCURRENT_STOCKS)*PER_STOCK_TIMEOUT_SEC + 20
-    deadline = time.monotonic() + budget
-    sem = _threading.Semaphore(MAX_CONCURRENT_STOCKS)
-
-    def _fetch_worker(symbol, company_name, sector):
-        rem = max(0, deadline - time.monotonic())
-        if not sem.acquire(timeout=rem):
-            with snap_lock: snap_timed_out.append(symbol)
-            return
-        try:
-            snap = provider.get_snapshot(symbol, company_name, sector)
-            with snap_lock: raw_snaps[symbol] = snap
-        except Exception as e:
-            with snap_lock: snap_failed.append((symbol, str(e)))
-        finally:
-            sem.release()
-
-    threads = [_threading.Thread(target=_fetch_worker, args=item, daemon=True) for item in universe]
-    for t in threads: t.start()
-    deadline2 = deadline
-    pending = dict(zip([i[0] for i in universe], threads))
-    while pending and time.monotonic() < deadline2:
-        done = [s for s,t in pending.items() if not t.is_alive()]
-        for s in done: del pending[s]
-        if pending: time.sleep(0.2)
-    for sym in pending:
-        if sym not in snap_timed_out: snap_timed_out.append(sym)
-
-    # Compute + inject sector stats
-    valid_snaps = list(raw_snaps.values())
-    sector_stats = compute_sector_stats(valid_snaps)
-    logger.info("Computed sector stats for %d sector(s) from %d snapshots",
-                len(sector_stats), len(valid_snaps))
-    for sym in raw_snaps:
-        inject_sector_stats(raw_snaps[sym], sector_stats)
-
-    # Pass 2: score
-    all_recs = []; latest_prices: dict = {}
-    score_timed_out = []; score_failed = []
-    score_lock = _threading.Lock()
-    sem2 = _threading.Semaphore(MAX_CONCURRENT_STOCKS)
-    deadline3 = time.monotonic() + budget
-
-    def _score_worker(symbol, company_name, sector):
-        snap = raw_snaps.get(symbol)
-        if snap is None: return
-        rem = max(0, deadline3 - time.monotonic())
-        if not sem2.acquire(timeout=rem):
-            with score_lock: score_timed_out.append(symbol)
-            return
-        try:
-            from core.feature_engineering import compute_technical_levels
-            from core.scoring import score_stock
-            from core.recommendation_engine import classify_market_cap
-            technicals = compute_technical_levels(snap)
-            if news_engine is not None:
-                news_result = news_engine.analyze(symbol, company_name, sector)
-            else:
-                news_result = NewsAnalysisResult.empty(symbol, company_name, reason="disabled")
-            scores = score_stock(snap, technicals, news_result)
-            mcap_cat = classify_market_cap(snap.market_cap)
-            rec = build_recommendation(snap, technicals, scores, news_result,
-                                        market_cap_category=mcap_cat, rec_date=date.today())
-            with score_lock:
-                latest_prices[symbol] = snap.price
-                if rec is not None: all_recs.append(rec)
-        except Exception as e:
-            with score_lock: score_failed.append((symbol, str(e)))
-        finally:
-            sem2.release()
-
-    threads2 = [_threading.Thread(target=_score_worker, args=item, daemon=True) for item in universe]
-    for t in threads2: t.start()
-    pending2 = dict(zip([i[0] for i in universe], threads2))
-    while pending2 and time.monotonic() < deadline3:
-        done2 = [s for s,t in pending2.items() if not t.is_alive()]
-        for s in done2: del pending2[s]
-        if pending2: time.sleep(0.2)
-
-    timed_out = snap_timed_out + score_timed_out
-    failed = snap_failed + score_failed
+    all_recs, latest_prices, timed_out, failed = _process_universe_concurrently(
+        provider, news_engine, universe,
+    )
 
     if timed_out:
         logger.warning("%d stock(s) timed out after %ds: %s%s", len(timed_out), PER_STOCK_TIMEOUT_SEC,
