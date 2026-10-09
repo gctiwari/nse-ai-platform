@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NSE/BSE AI Recommendation &amp; Paper Trading Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">AI Stock Desk</span>
+    <span class="brand-sub">NSE / BSE &middot; Paper Trading Only</span>
+  </div>
+  <div class="run-controls">
+    <select id="providerSelect" title="Data source">
+      <option value="yfinance" selected>Live (yfinance)</option>
+      <option value="demo">Offline demo data</option>
+    </select>
+    <label class="news-toggle"><input type="checkbox" id="newsToggle" checked> News sentiment</label>
+    <button id="runBtn" class="btn-primary">Run AI Analysis</button>
+  </div>
+</div>
+
+<div class="banner">NEVER places real trades &mdash; recommendations and simulated paper trades only.</div>
+
+<div id="runStatus" class="run-status hidden"></div>
+
+<header class="dashboard-header">
+  <div class="dh-row">
+    <div id="serverTime" class="dh-time">&mdash;</div>
+    <div id="marketStatus" class="dh-market">Market: &mdash;</div>
+    <div id="universeInfo" class="dh-universe">Not yet run</div>
+    <div id="lastRun" class="dh-lastrun"></div>
+  </div>
+  <div id="indices" class="dh-indices"></div>
+</header>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="Watchlist">Watchlist</button>
+  <button class="tab-btn" data-tab="Conservative">Conservative</button>
+  <button class="tab-btn" data-tab="Balanced">Balanced</button>
+  <button class="tab-btn" data-tab="Aggressive">Aggressive</button>
+  <button class="tab-btn" data-tab="PaperTrading">Paper Trading</button>
+  <button class="tab-btn" data-tab="History">History</button>
+</nav>
+
+<main id="tabContent"></main>
+
+<template id="tpl-card">
+  <article class="card">
+    <div class="card-head">
+      <span class="card-rank"></span>
+      <span class="card-name"></span>
+      <span class="card-score"></span>
+    </div>
+    <div class="card-grid"></div>
+    <p class="card-reason"></p>
+    <div class="card-news"></div>
+    <div class="card-tech"></div>
+  </article>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
